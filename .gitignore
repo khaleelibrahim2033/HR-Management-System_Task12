@@ -1,4 +1,4 @@
-﻿.env
+.env
 .venv/
 venv/
 __pycache__/
@@ -6,4 +6,6 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 *.log
-worksphere.db
+*.db
+node_modules/
+dist/
