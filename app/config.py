@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     bootstrap_admin_username: str | None = None
     bootstrap_admin_email: str | None = None
     bootstrap_admin_password: str | None = None
+    document_storage_dir: str = "uploads"
+    document_max_size_bytes: int = Field(default=10_485_760, ge=1, le=52_428_800)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

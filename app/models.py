@@ -1,7 +1,7 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from enum import Enum
 
-from sqlalchemy import Boolean, Date, DateTime, Enum as SqlEnum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum as SqlEnum, Float, ForeignKey, Integer, String, Text, Time as SQLTime, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -82,6 +82,8 @@ class Attendance(Base):
     date: Mapped[date] = mapped_column(Date, index=True)
     status: Mapped[AttendanceStatus] = mapped_column(SqlEnum(AttendanceStatus), default=AttendanceStatus.PRESENT)
     is_late: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_early: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_early_out: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     employee: Mapped[Employee] = relationship(back_populates="attendance")
 
 
@@ -142,3 +144,48 @@ class Notification(Base):
     message: Mapped[str] = mapped_column(Text)
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Shift(Base):
+    __tablename__ = "shifts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    start_time: Mapped[time] = mapped_column(SQLTime)
+    end_time: Mapped[time] = mapped_column(SQLTime)
+    employee_shifts: Mapped[list["EmployeeShift"]] = relationship(back_populates="shift")
+
+
+class EmployeeShift(Base):
+    __tablename__ = "employee_shifts"
+    __table_args__ = (UniqueConstraint("employee_id", name="uq_employee_shift_employee"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    shift_id: Mapped[int] = mapped_column(ForeignKey("shifts.id"), index=True)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    employee: Mapped[Employee] = relationship()
+    shift: Mapped[Shift] = relationship(back_populates="employee_shifts")
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    file_name: Mapped[str] = mapped_column(String(255))
+    file_url: Mapped[str] = mapped_column(String(255), unique=True)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    employee: Mapped[Employee] = relationship()
+
+
+class Performance(Base):
+    __tablename__ = "performance"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    review_period: Mapped[str] = mapped_column(String(80), index=True)
+    rating: Mapped[float] = mapped_column(Float)
+    feedback: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    employee: Mapped[Employee] = relationship()

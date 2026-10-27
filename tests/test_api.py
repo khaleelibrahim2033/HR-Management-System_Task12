@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
+from app.config import settings
 from app.models import Role, User
 from app.security import hash_password
 
@@ -200,3 +201,95 @@ def test_leave_balances_prevent_overuse_and_deduct_on_approval(client: TestClien
         "end_date": (start + timedelta(days=24)).isoformat(), "reason": "More recovery",
     })
     assert excess_after_approval.status_code == 409
+
+
+def test_phase_three_shift_calendar_documents_performance_and_reports(client: TestClient, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "document_storage_dir", str(tmp_path))
+    session_generator = app.dependency_overrides[get_db]()
+    db = next(session_generator)
+    db.add(User(
+        username="phase3admin", email="phase3admin@example.com",
+        hashed_password=hash_password("StrongPass123"), role=Role.ADMIN,
+    ))
+    db.commit()
+    session_generator.close()
+    admin_login = client.post("/auth/login", data={"username": "phase3admin", "password": "StrongPass123"}).json()
+    admin_headers = {"Authorization": "Bearer " + admin_login["access_token"]}
+    employee_login = client.post("/auth/register", json={
+        "username": "phase3employee", "email": "phase3employee@example.com",
+        "password": "StrongPass123", "full_name": "Phase Three Employee",
+    }).json()
+    employee_headers = {"Authorization": "Bearer " + employee_login["access_token"]}
+    employee_id = client.get("/employees", headers=employee_headers).json()[0]["id"]
+
+    assert client.post("/shifts", headers=employee_headers, json={
+        "name": "Unauthorized shift", "start_time": "09:00", "end_time": "17:00",
+    }).status_code == 403
+    shift = client.post("/shifts", headers=admin_headers, json={
+        "name": "Overnight", "start_time": "00:00", "end_time": "23:59",
+    })
+    assert shift.status_code == 201
+    assigned = client.post("/employee-shifts", headers=admin_headers, json={
+        "employee_id": employee_id, "shift_id": shift.json()["id"],
+    })
+    assert assigned.status_code == 201
+    assert client.get("/employee-shifts", headers=employee_headers).json()[0]["shift_name"] == "Overnight"
+
+    attendance = client.post("/attendance/check-in", headers=employee_headers)
+    assert attendance.status_code == 201
+    assert attendance.json()["is_late"] is True
+    checkout = client.post("/attendance/check-out", headers=employee_headers)
+    assert checkout.status_code == 200
+    assert checkout.json()["is_early_out"] is True
+    assert "Late attendance detected" in [
+        row["title"] for row in client.get("/notifications", headers=employee_headers).json()
+    ]
+    assert "Late attendance alert" in [
+        row["title"] for row in client.get("/notifications", headers=admin_headers).json()
+    ]
+    attendance_history = client.get("/attendance", headers=employee_headers).json()
+    assert any(row["status"] == "ABSENT" for row in attendance_history)
+
+    review = client.post("/performance", headers=admin_headers, json={
+        "employee_id": employee_id, "review_period": "2026 Q4", "rating": 4.5, "feedback": "Excellent work.",
+    })
+    assert review.status_code == 201
+    assert client.get("/performance", headers=employee_headers).json()[0]["rating"] == 4.5
+    assert len(client.get("/employees?performance_min_rating=4", headers=admin_headers).json()) == 1
+    assert len(client.get("/employees?role=EMPLOYEE&department=Unassigned", headers=admin_headers).json()) == 1
+
+    start = date.today() + timedelta(days=2)
+    leave = client.post("/leaves", headers=employee_headers, json={
+        "leave_type": "CASUAL", "start_date": start.isoformat(), "end_date": start.isoformat(),
+        "reason": "Personal time",
+    })
+    assert leave.status_code == 201
+    calendar = client.get(
+        f"/leaves/calendar?start_date={start.isoformat()}&end_date={start.isoformat()}",
+        headers=admin_headers,
+    )
+    assert calendar.status_code == 200
+    assert calendar.json()[0]["employee_name"] == "Phase Three Employee"
+
+    uploaded = client.post(
+        f"/documents?employee_id={employee_id}", headers=admin_headers,
+        files={"file": ("identity.pdf", b"%PDF-1.4 test document", "application/pdf")},
+    )
+    assert uploaded.status_code == 201
+    document_id = uploaded.json()["id"]
+    assert client.get("/documents", headers=employee_headers).json()[0]["file_name"] == "identity.pdf"
+    assert client.get(f"/documents/{document_id}/download", headers=employee_headers).content == b"%PDF-1.4 test document"
+    second_employee = client.post("/auth/register", json={
+        "username": "phase3other", "email": "phase3other@example.com",
+        "password": "StrongPass123", "full_name": "Other Employee",
+    }).json()
+    second_headers = {"Authorization": "Bearer " + second_employee["access_token"]}
+    assert client.get(f"/documents/{document_id}/download", headers=second_headers).status_code == 403
+
+    report = client.get(
+        f"/reports/analytics?start_date={date.today().isoformat()}&end_date={date.today().isoformat()}",
+        headers=admin_headers,
+    )
+    assert report.status_code == 200
+    assert report.json()["performance_by_department"][0]["average_rating"] == 4.5
+    assert any(row["status"] == "LATE" for row in report.json()["attendance_trends"])

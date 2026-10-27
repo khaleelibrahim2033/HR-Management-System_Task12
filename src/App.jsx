@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { Activity, ArrowDownToLine, Bell, BriefcaseBusiness, CalendarDays, Check, ChevronDown, CircleDollarSign, Clock3, LayoutDashboard, LogOut, Menu, Search, Shield, UserRound, Users, X } from "lucide-react";
+import { Activity, ArrowDownToLine, Bell, BriefcaseBusiness, CalendarDays, Check, ChevronDown, CircleDollarSign, Clock3, LayoutDashboard, LogOut, Menu, Search, Shield, UserRound, Users, X, FileText, Star, BarChart3 } from "lucide-react";
 import { request } from "./api";
+import { ShiftManagement, LeaveCalendar, DocumentCenter, PerformanceReviews, ReportsDashboard } from "./Phase3";
 
 const today = new Date().toISOString().slice(0, 10);
 const monthNow = today.slice(0, 7);
@@ -9,7 +10,12 @@ const navItems = [
   { key: "profile", label: "My profile", icon: UserRound, employeeOnly: true },
   { key: "employees", label: "Employees", icon: Users, hrOnly: true },
   { key: "attendance", label: "Attendance", icon: Clock3 },
+  { key: "shifts", label: "Shift management", icon: Clock3 },
   { key: "leaves", label: "Leave management", icon: CalendarDays },
+  { key: "leave-calendar", label: "Leave calendar", icon: CalendarDays },
+  { key: "documents", label: "Documents", icon: FileText },
+  { key: "performance", label: "Performance", icon: Star },
+  { key: "reports", label: "Reports & insights", icon: BarChart3, hrOnly: true },
   { key: "policies", label: "Leave policies", icon: CalendarDays, hrOnly: true },
   { key: "payroll", label: "Payroll", icon: CircleDollarSign },
   { key: "users", label: "User management", icon: Shield, adminOnly: true },
@@ -47,7 +53,11 @@ export default function App() {
     }).catch(logout);
   }, []);
   useEffect(() => {
-    if (user) request("/notifications").then(setNotifications).catch((err) => setError(err.message));
+    if (!user) return;
+    const refreshNotifications = () => request("/notifications").then(setNotifications).catch((err) => setError(err.message));
+    refreshNotifications();
+    const timer = window.setInterval(refreshNotifications, 30000);
+    return () => window.clearInterval(timer);
   }, [user, refreshKey]);
   if (!user) return <AuthScreen onLogin={onLogin} />;
   const visibleNav = navItems.filter((item) =>
@@ -88,7 +98,12 @@ export default function App() {
         {page === "profile" && <MyProfile refreshKey={refreshKey} onError={fail} />}
         {page === "employees" && <Employees refreshKey={refreshKey} flash={flash} onError={fail} />}
         {page === "attendance" && <Attendance user={user} refreshKey={refreshKey} flash={flash} onError={fail} />}
+        {page === "shifts" && <ShiftManagement user={user} refreshKey={refreshKey} onError={fail} flash={flash} />}
         {page === "leaves" && <Leaves user={user} refreshKey={refreshKey} flash={flash} onError={fail} />}
+        {page === "leave-calendar" && <LeaveCalendar user={user} refreshKey={refreshKey} onError={fail} />}
+        {page === "documents" && <DocumentCenter user={user} refreshKey={refreshKey} onError={fail} flash={flash} />}
+        {page === "performance" && <PerformanceReviews user={user} refreshKey={refreshKey} onError={fail} flash={flash} />}
+        {page === "reports" && <ReportsDashboard refreshKey={refreshKey} onError={fail} />}
         {page === "policies" && <LeavePolicies refreshKey={refreshKey} flash={flash} onError={fail} />}
         {page === "payroll" && <Payroll user={user} refreshKey={refreshKey} flash={flash} onError={fail} />}
         {page === "users" && <UsersAdmin refreshKey={refreshKey} flash={flash} onError={fail} />}
@@ -98,11 +113,11 @@ export default function App() {
 }
 
 function pageTitle(page) {
-  return ({ overview: "Good morning", profile: "My profile", employees: "Your people", attendance: "Attendance", leaves: "Leave management", policies: "Leave policies", payroll: "Payroll", users: "User management" })[page] || "Overview";
+  return ({ overview: "Good morning", profile: "My profile", employees: "Your people", attendance: "Attendance", shifts: "Shift management", leaves: "Leave management", "leave-calendar": "Leave calendar", documents: "Documents", performance: "Performance reviews", reports: "Reports & insights", policies: "Leave policies", payroll: "Payroll", users: "User management" })[page] || "Overview";
 }
 function pageSubtitle(page, role) {
   if (page === "overview") return role === "EMPLOYEE" ? "Here's what's happening with your workday." : "Here's what's happening across your organization today.";
-  return ({ profile: "Your personal employment and account details.", employees: "Manage your team and keep employee information up to date.", attendance: "Track working hours and review attendance history.", leaves: "Review leave requests and keep time off organized.", policies: "Configure leave entitlements and review employee balances.", payroll: "Manage compensation and monthly payslips.", users: "Create accounts, assign roles, and control account access." })[page];
+  return ({ profile: "Your personal employment and account details.", employees: "Search and filter your people by role, status, attendance, and performance.", attendance: "Track working hours and review attendance history.", shifts: "Assign schedules and review each employee's shift.", leaves: "Review leave requests and keep time off organized.", "leave-calendar": "See approved time off and team availability.", documents: "Securely upload and access employee documents.", performance: "Review ratings and keep feedback history in one place.", reports: "Explore attendance, leave, performance, and department trends.", policies: "Configure leave entitlements and review employee balances.", payroll: "Manage compensation and monthly payslips.", users: "Create accounts, assign roles, and control account access." })[page];
 }
 
 function AuthScreen({ onLogin }) {
@@ -190,6 +205,10 @@ function Employees({ refreshKey, flash, onError }) {
   const [rows, setRows] = useState([]);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
+  const [department, setDepartment] = useState("");
+  const [role, setRole] = useState("");
+  const [attendanceStatus, setAttendanceStatus] = useState("");
+  const [performanceRating, setPerformanceRating] = useState("");
   const [modal, setModal] = useState(false);
   const [editing, setEditing] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -197,8 +216,12 @@ function Employees({ refreshKey, flash, onError }) {
     const params = new URLSearchParams();
     if (search) params.set("search", search);
     if (status) params.set("status", status);
+    if (department) params.set("department", department);
+    if (role) params.set("role", role);
+    if (attendanceStatus) params.set("attendance_status", attendanceStatus);
+    if (performanceRating) params.set("performance_min_rating", performanceRating);
     return request(`/employees${params.size ? `?${params}` : ""}`).then(setRows).catch((err) => onError(err.message));
-  }, [search, status, refreshKey]);
+  }, [search, status, department, role, attendanceStatus, performanceRating, refreshKey, onError]);
   useEffect(() => { load(); }, [load]);
   useEffect(() => { const open = () => { setEditing(null); setModal(true); }; window.addEventListener("open-employee-form", open); return () => window.removeEventListener("open-employee-form", open); }, []);
   const submit = async (event) => {
@@ -209,7 +232,14 @@ function Employees({ refreshKey, flash, onError }) {
       setModal(false); setEditing(null); flash(editing ? "Employee profile updated." : "Employee account created."); load();
     } catch (err) { onError(err.message); }
   };
-  return <><section className="panel table-panel"><div className="table-toolbar"><div><strong>All employees</strong><small>People and their current details</small></div><div className="table-filters"><label className="search-box"><Search size={16} /><input placeholder="Search people…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><select className="status-filter" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option></select></div></div>{rows.length ? <EmployeeTable employees={rows} onEdit={(employee) => { setEditing(employee); setModal(true); }} onProfile={async (employee) => { try { setProfile(await request(`/employees/${employee.id}`)); } catch (err) { onError(err.message); } }} /> : <EmptyState text="No employees found." />}</section>
+  return <><section className="panel table-panel"><div className="table-toolbar"><div><strong>All employees</strong><small>People and their current details</small></div><div className="table-filters advanced-filters">
+    <label className="search-box"><Search size={16} /><input placeholder="Search name or role…" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
+    <input className="status-filter" aria-label="Department filter" placeholder="Department" value={department} onChange={(event) => setDepartment(event.target.value)} />
+    <select className="status-filter" aria-label="Role filter" value={role} onChange={(event) => setRole(event.target.value)}><option value="">All roles</option><option value="EMPLOYEE">Employee</option><option value="HR">HR</option><option value="ADMIN">Admin</option></select>
+    <select className="status-filter" aria-label="Status filter" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option></select>
+    <select className="status-filter" aria-label="Attendance filter" value={attendanceStatus} onChange={(event) => setAttendanceStatus(event.target.value)}><option value="">All attendance</option><option value="PRESENT">Present</option><option value="LATE">Late</option><option value="ABSENT">Absent</option><option value="HALF_DAY">Half day</option></select>
+    <select className="status-filter" aria-label="Performance filter" value={performanceRating} onChange={(event) => setPerformanceRating(event.target.value)}><option value="">All ratings</option><option value="4">4+ rating</option><option value="3">3+ rating</option><option value="2">2+ rating</option></select>
+  </div></div>{rows.length ? <EmployeeTable employees={rows} onEdit={(employee) => { setEditing(employee); setModal(true); }} onProfile={async (employee) => { try { setProfile(await request(`/employees/${employee.id}`)); } catch (err) { onError(err.message); } }} /> : <EmptyState text="No employees found." />}</section>
     {modal && <Modal title={editing ? "Edit employee" : "Add an employee"} close={() => setModal(false)}><form className="modal-form" onSubmit={submit}>
       {!editing && <><Field label="Username" name="username" required /><Field label="Work email" name="email" type="email" required /><Field label="Temporary password" name="password" type="password" minLength="8" required /></>}
       <Field label="Full name" name="full_name" required defaultValue={editing?.full_name} /><Field label="Job title" name="designation" required defaultValue={editing?.designation} /><Field label="Department" name="department" required defaultValue={editing?.department} />
@@ -222,7 +252,7 @@ function Employees({ refreshKey, flash, onError }) {
 }
 
 function EmployeeTable({ employees, onEdit, onProfile }) {
-  return <div className="table-scroll"><table><thead><tr><th>EMPLOYEE</th><th>DEPARTMENT</th><th>JOB TITLE</th><th>JOINED</th><th>STATUS</th><th /></tr></thead><tbody>{employees.map((employee, index) => <tr key={employee.id}><td><div className="person-cell"><div className={`avatar avatar-${index % 4}`}>{initials(employee.full_name)}</div><span><strong>{onProfile ? <button className="person-link" onClick={() => onProfile(employee)}>{employee.full_name}</button> : employee.full_name}</strong><small>{employee.email}</small></span></div></td><td>{employee.department}</td><td>{employee.designation}</td><td>{dateLabel(employee.joining_date)}</td><td><StatusBadge value={employee.status} /></td><td>{onEdit && <button className="text-button" onClick={() => onEdit(employee)}>Edit</button>}</td></tr>)}</tbody></table></div>;
+  return <div className="table-scroll"><table><thead><tr><th>EMPLOYEE</th><th>DEPARTMENT</th><th>JOB TITLE</th><th>ROLE</th><th>JOINED</th><th>STATUS</th><th /></tr></thead><tbody>{employees.map((employee, index) => <tr key={employee.id}><td><div className="person-cell"><div className={`avatar avatar-${index % 4}`}>{initials(employee.full_name)}</div><span><strong>{onProfile ? <button className="person-link" onClick={() => onProfile(employee)}>{employee.full_name}</button> : employee.full_name}</strong><small>{employee.email}</small></span></div></td><td>{employee.department}</td><td>{employee.designation}</td><td>{employee.role || "EMPLOYEE"}</td><td>{dateLabel(employee.joining_date)}</td><td><StatusBadge value={employee.status} /></td><td>{onEdit && <button className="text-button" onClick={() => onEdit(employee)}>Edit</button>}</td></tr>)}</tbody></table></div>;
 }
 
 function Attendance({ user, refreshKey, flash, onError }) {
@@ -241,7 +271,7 @@ function Attendance({ user, refreshKey, flash, onError }) {
   return <div className="stack-layout">
     {!isHR && <section className="panel checkin-panel"><div className="checkin-copy"><div className="eyebrow">YOUR WORKDAY</div><h2>{todayRow?.check_out ? "You’ve wrapped up for today." : todayRow?.check_in ? "You’re checked in." : "Ready when you are."}</h2><p>{todayRow?.check_in ? `Checked in at ${new Date(todayRow.check_in).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}${todayRow.check_out ? ` · checked out at ${new Date(todayRow.check_out).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}` : "Start your day by checking in. Remember to check out when you’re done."}</p></div><div className="checkin-actions"><div className="workday-clock">{new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}<small>LOCAL TIME</small></div>{!todayRow?.check_in ? <button disabled={busy} className="button button-primary" onClick={() => mark("check-in")}><Clock3 size={17} /> Check in</button> : !todayRow?.check_out ? <button disabled={busy} className="button button-dark" onClick={() => mark("check-out")}><Clock3 size={17} /> Check out</button> : <span className="done-chip"><Check size={16} /> Complete</span>}</div></section>}
     {isHR && <section className="panel"><PanelTitle title="Mark attendance" subtitle="Add a record for an employee" /><form className="inline-form" onSubmit={submitManual}><label className="field">Employee<select name="employee_id" required defaultValue=""><option value="" disabled>Select employee</option>{employees.map((employee) => <option key={employee.id} value={employee.id}>{employee.full_name}</option>)}</select></label><Field label="Date" name="date" type="date" defaultValue={today} required /><label className="field">Status<select name="status"><option>PRESENT</option><option>LATE</option><option>ABSENT</option><option>HALF_DAY</option></select></label><button className="button button-primary">Save record</button></form></section>}
-    <section className="panel table-panel"><PanelTitle title="Attendance history" subtitle="Late arrivals and hours are tracked automatically" />{rows.length ? <div className="table-scroll"><table><thead><tr><th>EMPLOYEE</th><th>DATE</th><th>CHECK IN</th><th>CHECK OUT</th><th>HOURS</th><th>STATUS</th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td><strong>{row.employee_name}</strong></td><td>{dateLabel(row.date)}</td><td>{row.check_in ? new Date(row.check_in).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "—"}</td><td>{row.check_out ? new Date(row.check_out).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "—"}</td><td>{row.working_hours ? `${row.working_hours}h` : "—"}</td><td><StatusBadge value={row.is_late ? "LATE" : row.status} /></td></tr>)}</tbody></table></div> : <EmptyState text="No attendance records yet." />}</section>
+    <section className="panel table-panel"><PanelTitle title="Attendance history" subtitle="Late and early arrivals, early check-outs, and hours are tracked automatically" />{rows.length ? <div className="table-scroll"><table><thead><tr><th>EMPLOYEE</th><th>DATE</th><th>CHECK IN</th><th>CHECK OUT</th><th>HOURS</th><th>STATUS</th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td><strong>{row.employee_name}</strong></td><td>{dateLabel(row.date)}</td><td>{row.check_in ? new Date(row.check_in).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "—"}</td><td>{row.check_out ? new Date(row.check_out).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "—"}</td><td>{row.working_hours ? `${row.working_hours}h` : "—"}</td><td><StatusBadge value={row.is_late ? "LATE" : row.is_early ? "EARLY" : row.is_early_out ? "EARLY_OUT" : row.status} /></td></tr>)}</tbody></table></div> : <EmptyState text="No attendance records yet." />}</section>
   </div>;
 }
 

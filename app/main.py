@@ -1,24 +1,28 @@
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from uuid import uuid4
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import func, inspect, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import Base, SessionLocal, engine, get_db
 from .models import (
     Attendance, AttendanceStatus, Employee, EmployeeStatus, Leave, LeaveBalance, LeavePolicy, LeaveStatus,
-    LeaveType, Notification, Payroll, Role, User,
+    LeaveType, Notification, Payroll, Role, User, Shift, EmployeeShift, Document, Performance,
 )
 from .schemas import (
     AdminUserCreate, AdminUserUpdate, AttendanceMark, AttendanceOut, EmployeeCreate, EmployeeOut, EmployeeUpdate,
     LeaveBalanceOut, LeaveCreate, LeaveOut, LeavePolicyCreate, LeavePolicyOut, LeavePolicyUpdate, LeaveReview,
-    NotificationOut, PayrollCreate, PayrollOut, RegisterInput, TokenOut, UserOut,
+    NotificationOut, PayrollCreate, PayrollOut, RegisterInput, TokenOut, UserOut, ShiftCreate, ShiftOut,
+    EmployeeShiftAssign, EmployeeShiftOut, DocumentOut, PerformanceCreate, PerformanceOut,
 )
 from .security import create_access_token, hash_password, verify_password
 
@@ -28,7 +32,11 @@ Base.metadata.create_all(bind=engine)
 def migrate_existing_schema() -> None:
     migrations = {
         "users": {"is_active": "BOOLEAN NOT NULL DEFAULT 1"},
-        "attendance": {"is_late": "BOOLEAN NOT NULL DEFAULT 0"},
+        "attendance": {
+            "is_late": "BOOLEAN NOT NULL DEFAULT 0",
+            "is_early": "BOOLEAN NOT NULL DEFAULT 0",
+            "is_early_out": "BOOLEAN NOT NULL DEFAULT 0",
+        },
         "payroll": {"allowances": "FLOAT NOT NULL DEFAULT 0"},
     }
     with engine.begin() as connection:
@@ -57,10 +65,14 @@ app = FastAPI(
         {"name": "Auth", "description": "Registration, sign-in, and user accounts"},
         {"name": "Employees", "description": "Employee profiles and directory"},
         {"name": "Attendance", "description": "Check-in, check-out, and attendance records"},
+        {"name": "Shifts", "description": "Shift configuration, assignments, and schedules"},
         {"name": "Leaves", "description": "Leave requests and approvals"},
+        {"name": "Documents", "description": "Protected employee document upload and access"},
+        {"name": "Performance", "description": "Employee reviews, ratings, and feedback history"},
         {"name": "Payroll", "description": "Payroll records and payslips"},
         {"name": "Notifications", "description": "Personal notifications"},
         {"name": "Dashboard", "description": "HR and administrator analytics"},
+        {"name": "Reports", "description": "Filtered HR analytics and department reports"},
     ],
 )
 app.add_middleware(
@@ -108,6 +120,7 @@ def employee_out(employee: Employee) -> dict:
         "designation": employee.designation, "department": employee.department,
         "joining_date": employee.joining_date, "salary": employee.salary, "status": employee.status,
         "username": employee.user.username, "email": employee.user.email,
+        "role": employee.user.role,
     }
 
 
@@ -118,8 +131,36 @@ def attendance_out(row: Attendance) -> dict:
         end = row.check_out.replace(tzinfo=timezone.utc) if row.check_out.tzinfo is None else row.check_out
         hours = round(max(0, (end - start).total_seconds()) / 3600, 2)
     return {"id": row.id, "employee_id": row.employee_id, "check_in": row.check_in, "check_out": row.check_out,
-            "date": row.date, "status": row.status, "is_late": row.is_late,
-            "working_hours": hours, "employee_name": row.employee.full_name}
+            "date": row.date, "status": row.status, "is_late": row.is_late, "is_early": row.is_early,
+            "is_early_out": row.is_early_out, "working_hours": hours, "employee_name": row.employee.full_name}
+
+
+def is_late_check_in(check_in: datetime | None, shift: EmployeeShift | None) -> bool:
+    if check_in is None:
+        return False
+    normalized = check_in.replace(tzinfo=timezone.utc) if check_in.tzinfo is None else check_in
+    scheduled_start = shift.shift.start_time if shift else settings.attendance_late_after
+    return normalized.astimezone().time().replace(tzinfo=None) > scheduled_start
+
+
+def is_early_check_in(check_in: datetime | None, shift: EmployeeShift | None) -> bool:
+    if check_in is None or shift is None:
+        return False
+    normalized = check_in.replace(tzinfo=timezone.utc) if check_in.tzinfo is None else check_in
+    return normalized.astimezone().time().replace(tzinfo=None) < shift.shift.start_time
+
+
+def is_early_check_out(check_out: datetime | None, attendance_date: date,
+                       shift: EmployeeShift | None) -> bool:
+    if check_out is None or shift is None:
+        return False
+    normalized = check_out.replace(tzinfo=timezone.utc) if check_out.tzinfo is None else check_out
+    local_checkout = normalized.astimezone()
+    shift_end_date = attendance_date + timedelta(
+        days=1 if shift.shift.end_time <= shift.shift.start_time else 0,
+    )
+    scheduled_end = datetime.combine(shift_end_date, shift.shift.end_time).astimezone()
+    return local_checkout < scheduled_end
 
 
 def leave_out(row: Leave) -> dict:
@@ -132,6 +173,29 @@ def payroll_out(row: Payroll) -> dict:
     return {"id": row.id, "employee_id": row.employee_id, "basic_salary": row.basic_salary,
             "allowances": row.allowances, "deductions": row.deductions, "bonus": row.bonus, "net_salary": row.net_salary,
             "month": row.month, "created_at": row.created_at, "employee_name": row.employee.full_name}
+
+
+def employee_shift_out(row: EmployeeShift) -> dict:
+    return {
+        "id": row.id, "employee_id": row.employee_id, "employee_name": row.employee.full_name,
+        "department": row.employee.department, "shift_id": row.shift_id, "shift_name": row.shift.name,
+        "start_time": row.shift.start_time, "end_time": row.shift.end_time,
+    }
+
+
+def document_out(row: Document) -> dict:
+    return {
+        "id": row.id, "employee_id": row.employee_id, "employee_name": row.employee.full_name,
+        "file_name": row.file_name, "file_url": f"/documents/{row.id}/download", "uploaded_at": row.uploaded_at,
+    }
+
+
+def performance_out(row: Performance) -> dict:
+    return {
+        "id": row.id, "employee_id": row.employee_id, "employee_name": row.employee.full_name,
+        "review_period": row.review_period, "rating": row.rating, "feedback": row.feedback,
+        "created_at": row.created_at,
+    }
 
 
 def leave_days(start_date: date, end_date: date) -> int:
@@ -159,8 +223,28 @@ def ensure_default_leave_policies(db: Session) -> None:
     db.flush()
 
 
+def ensure_default_shifts(db: Session) -> None:
+    defaults = {
+        "Morning": (time(9), time(17)),
+        "Evening": (time(14), time(22)),
+        "Night": (time(22), time(6)),
+    }
+    for name, (start_time, end_time) in defaults.items():
+        if db.scalar(select(Shift.id).where(Shift.name == name)) is None:
+            db.add(Shift(name=name, start_time=start_time, end_time=end_time))
+    db.flush()
+
+
 def notify(db: Session, user_id: int, title: str, message: str) -> None:
     db.add(Notification(user_id=user_id, title=title, message=message))
+
+
+def notify_hr_users(db: Session, title: str, message: str) -> None:
+    reviewers = db.scalars(select(User).where(
+        User.role.in_([Role.HR, Role.ADMIN]), User.is_active.is_(True),
+    )).all()
+    for reviewer in reviewers:
+        notify(db, reviewer.id, title, message)
 
 
 def bootstrap_admin() -> None:
@@ -171,6 +255,7 @@ def bootstrap_admin() -> None:
                         hashed_password=hash_password(settings.bootstrap_admin_password), role=Role.ADMIN))
             db.flush()
         ensure_default_leave_policies(db)
+        ensure_default_shifts(db)
         db.commit()
 
 
@@ -272,18 +357,106 @@ def deactivate_user(user_id: int, user: User = Depends(require_roles(Role.ADMIN)
 
 
 @app.get("/employees", response_model=list[EmployeeOut], tags=["Employees"])
-def list_employees(search: str | None = None, department: str | None = None, status_filter: EmployeeStatus | None = Query(default=None, alias="status"),
+def list_employees(search: str | None = Query(default=None, max_length=160),
+                   department: str | None = Query(default=None, max_length=120),
+                   status_filter: EmployeeStatus | None = Query(default=None, alias="status"),
+                   role_filter: Role | None = Query(default=None, alias="role"),
+                   attendance_status: AttendanceStatus | None = None,
+                   performance_min_rating: float | None = Query(default=None, ge=1, le=5),
                    user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     query = select(Employee).join(User)
     if user.role == Role.EMPLOYEE:
         query = query.where(Employee.user_id == user.id)
     if search:
-        query = query.where(func.lower(Employee.full_name).contains(search.lower()))
+        term = f"%{search.strip().lower()}%"
+        query = query.where(func.lower(Employee.full_name).like(term) | func.lower(Employee.designation).like(term)
+                            | func.lower(Employee.department).like(term) | func.lower(User.username).like(term)
+                            | func.lower(User.email).like(term))
     if department:
         query = query.where(func.lower(Employee.department) == department.lower())
     if status_filter:
         query = query.where(Employee.status == status_filter)
+    if role_filter:
+        query = query.where(User.role == role_filter)
+    if attendance_status:
+        attendance_match = select(Attendance.id).where(
+            Attendance.employee_id == Employee.id, Attendance.date == date.today(),
+        )
+        if attendance_status == AttendanceStatus.LATE:
+            attendance_match = attendance_match.where(
+                (Attendance.status == AttendanceStatus.LATE) | Attendance.is_late.is_(True),
+            )
+        elif attendance_status == AttendanceStatus.PRESENT:
+            attendance_match = attendance_match.where(
+                Attendance.status == AttendanceStatus.PRESENT, Attendance.is_late.is_(False),
+            )
+        else:
+            attendance_match = attendance_match.where(Attendance.status == attendance_status)
+        query = query.where(attendance_match.exists())
+    if performance_min_rating is not None:
+        query = query.where(select(Performance.id).where(
+            Performance.employee_id == Employee.id, Performance.rating >= performance_min_rating,
+        ).exists())
     return [employee_out(row) for row in db.scalars(query.order_by(Employee.full_name)).all()]
+
+
+@app.get("/shifts", response_model=list[ShiftOut], tags=["Shifts"])
+def list_shifts(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return db.scalars(select(Shift).order_by(Shift.start_time)).all()
+
+
+@app.post("/shifts", response_model=ShiftOut, status_code=201, tags=["Shifts"])
+def create_shift(payload: ShiftCreate, user: User = Depends(require_roles(Role.HR, Role.ADMIN)),
+                 db: Session = Depends(get_db)):
+    shift = Shift(**payload.model_dump())
+    db.add(shift)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A shift with this name already exists")
+    db.refresh(shift)
+    return shift
+
+
+@app.get("/employee-shifts", response_model=list[EmployeeShiftOut], tags=["Shifts"])
+def list_employee_shifts(employee_id: int | None = None, department: str | None = None,
+                         user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = select(EmployeeShift).join(Employee).join(User).join(Shift)
+    if user.role == Role.EMPLOYEE:
+        query = query.where(Employee.user_id == user.id)
+    elif employee_id is not None:
+        query = query.where(EmployeeShift.employee_id == employee_id)
+    if department:
+        query = query.where(func.lower(Employee.department) == department.lower())
+    return [employee_shift_out(row) for row in db.scalars(query.order_by(Employee.full_name)).all()]
+
+
+@app.post("/employee-shifts", response_model=EmployeeShiftOut, status_code=201, tags=["Shifts"])
+def assign_employee_shift(payload: EmployeeShiftAssign, user: User = Depends(require_roles(Role.HR, Role.ADMIN)),
+                          db: Session = Depends(get_db)):
+    employee = db.get(Employee, payload.employee_id)
+    shift = db.get(Shift, payload.shift_id)
+    if employee is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if employee.status != EmployeeStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail="Inactive employees cannot be assigned a shift")
+    if shift is None:
+        raise HTTPException(status_code=404, detail="Shift not found")
+    assignment = db.scalar(select(EmployeeShift).where(EmployeeShift.employee_id == employee.id))
+    if assignment is None:
+        assignment = EmployeeShift(employee_id=employee.id, shift_id=shift.id)
+        db.add(assignment)
+    else:
+        assignment.shift_id = shift.id
+        assignment.assigned_at = datetime.now(timezone.utc)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="An employee shift assignment already exists")
+    db.refresh(assignment)
+    return employee_shift_out(assignment)
 
 
 @app.post("/employees", response_model=EmployeeOut, status_code=201, tags=["Employees"])
@@ -335,15 +508,24 @@ def check_in(user: User = Depends(get_current_user), db: Session = Depends(get_d
     if row and row.check_in:
         raise HTTPException(status_code=409, detail="You have already checked in today")
     check_in_time = datetime.now(timezone.utc)
-    is_late = check_in_time.astimezone().time() > settings.attendance_late_after
+    assignment = db.scalar(select(EmployeeShift).where(EmployeeShift.employee_id == employee.id))
+    is_late = is_late_check_in(check_in_time, assignment)
+    is_early = is_early_check_in(check_in_time, assignment)
+    scheduled_start = assignment.shift.start_time if assignment else settings.attendance_late_after
     if row is None:
         row = Attendance(employee_id=employee.id, date=today, status=AttendanceStatus.PRESENT,
-                         check_in=check_in_time, is_late=is_late)
+                         check_in=check_in_time, is_late=is_late, is_early=is_early)
         db.add(row)
     else:
         row.check_in = check_in_time
         row.status = AttendanceStatus.PRESENT
         row.is_late = is_late
+        row.is_early = is_early
+    if is_late:
+        notify(db, user.id, "Late attendance detected",
+               f"Your check-in was after your scheduled start time of {scheduled_start.strftime('%H:%M')}.")
+        notify_hr_users(db, "Late attendance alert",
+                        f"{employee.full_name} checked in after the scheduled start time of {scheduled_start.strftime('%H:%M')}.")
     db.commit()
     db.refresh(row)
     return attendance_out(row)
@@ -358,6 +540,8 @@ def check_out(user: User = Depends(get_current_user), db: Session = Depends(get_
     if row.check_out:
         raise HTTPException(status_code=409, detail="You have already checked out today")
     row.check_out = datetime.now(timezone.utc)
+    assignment = db.scalar(select(EmployeeShift).where(EmployeeShift.employee_id == employee.id))
+    row.is_early_out = is_early_check_out(row.check_out, row.date, assignment)
     db.commit()
     db.refresh(row)
     return attendance_out(row)
@@ -373,6 +557,13 @@ def list_attendance(employee_id: int | None = None, user: User = Depends(get_cur
         active_query = active_query.where(Employee.user_id == user.id)
     active_employees = db.scalars(active_query).all()
     for employee in active_employees:
+        assignment = db.scalar(select(EmployeeShift).where(EmployeeShift.employee_id == employee.id))
+        if assignment:
+            overnight = assignment.shift.end_time <= assignment.shift.start_time
+            shift_end_date = yesterday + timedelta(days=1 if overnight else 0)
+            scheduled_end = datetime.combine(shift_end_date, assignment.shift.end_time).astimezone()
+            if datetime.now().astimezone() < scheduled_end:
+                continue
         existing = db.scalar(select(Attendance).where(Attendance.employee_id == employee.id, Attendance.date == yesterday))
         approved_leave = db.scalar(select(Leave.id).where(
             Leave.employee_id == employee.id, Leave.status == LeaveStatus.APPROVED,
@@ -401,7 +592,10 @@ def mark_attendance(payload: AttendanceMark, user: User = Depends(require_roles(
         db.add(row)
     else:
         row.status, row.check_in, row.check_out = payload.status, payload.check_in, payload.check_out
-        row.is_late = payload.status == AttendanceStatus.LATE
+    assignment = db.scalar(select(EmployeeShift).where(EmployeeShift.employee_id == employee.id))
+    row.is_late = payload.status == AttendanceStatus.LATE or is_late_check_in(payload.check_in, assignment)
+    row.is_early = is_early_check_in(payload.check_in, assignment)
+    row.is_early_out = is_early_check_out(payload.check_out, payload.date, assignment)
     if payload.status in (AttendanceStatus.ABSENT, AttendanceStatus.HALF_DAY):
         notify(db, employee.user_id, "Attendance updated",
                f"Your attendance for {payload.date} was marked {payload.status.value.lower().replace('_', ' ')}.")
@@ -416,6 +610,25 @@ def list_leaves(user: User = Depends(get_current_user), db: Session = Depends(ge
     if user.role == Role.EMPLOYEE:
         query = query.where(Leave.employee_id == get_employee(db, user).id)
     return [leave_out(row) for row in db.scalars(query.order_by(Leave.created_at.desc())).all()]
+
+
+@app.get("/leaves/calendar", tags=["Leaves"])
+def leave_calendar(start_date: date | None = None, end_date: date | None = None, department: str | None = None,
+                   user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    start = start_date or date.today().replace(day=1)
+    end = end_date or (start + timedelta(days=62))
+    if end < start or (end - start).days > 366:
+        raise HTTPException(status_code=422, detail="Calendar range must be valid and no longer than 367 days")
+    query = select(Leave).join(Employee).where(
+        Leave.status.in_([LeaveStatus.PENDING, LeaveStatus.APPROVED]),
+        Leave.start_date <= end, Leave.end_date >= start,
+    )
+    if user.role == Role.EMPLOYEE:
+        query = query.where(Employee.user_id == user.id)
+    if department:
+        query = query.where(func.lower(Employee.department) == department.lower())
+    rows = db.scalars(query.order_by(Leave.start_date, Employee.full_name)).all()
+    return [leave_out(row) for row in rows]
 
 
 @app.post("/leaves", response_model=LeaveOut, status_code=201, tags=["Leaves"])
@@ -482,6 +695,164 @@ def review_leave(leave_id: int, payload: LeaveReview, user: User = Depends(requi
     db.commit()
     db.refresh(row)
     return leave_out(row)
+
+
+@app.get("/documents", response_model=list[DocumentOut], tags=["Documents"])
+def list_documents(employee_id: int | None = None, user: User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    query = select(Document).join(Employee)
+    if user.role == Role.EMPLOYEE:
+        query = query.where(Employee.user_id == user.id)
+    elif employee_id is not None:
+        query = query.where(Document.employee_id == employee_id)
+    return [document_out(row) for row in db.scalars(query.order_by(Document.uploaded_at.desc())).all()]
+
+
+@app.post("/documents", response_model=DocumentOut, status_code=201, tags=["Documents"])
+def upload_document(file: UploadFile = File(...), employee_id: int | None = None,
+                    user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role == Role.EMPLOYEE:
+        employee = get_employee(db, user)
+        if employee_id is not None and employee_id != employee.id:
+            raise HTTPException(status_code=403, detail="You can only upload documents to your own profile")
+    else:
+        if employee_id is None:
+            raise HTTPException(status_code=422, detail="employee_id is required for HR and administrators")
+        employee = db.get(Employee, employee_id)
+        if employee is None:
+            raise HTTPException(status_code=404, detail="Employee not found")
+
+    original_name = (file.filename or "").replace("\\", "/").split("/")[-1].strip()
+    extension = Path(original_name).suffix.lower()
+    supported_types = {
+        ".pdf": {"application/pdf", "application/octet-stream"},
+        ".png": {"image/png", "application/octet-stream"},
+        ".jpg": {"image/jpeg", "application/octet-stream"},
+        ".jpeg": {"image/jpeg", "application/octet-stream"},
+        ".doc": {"application/msword", "application/octet-stream"},
+        ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/octet-stream"},
+    }
+    if not original_name or len(original_name) > 255 or extension not in supported_types:
+        raise HTTPException(status_code=415, detail="Upload a PDF, DOC, DOCX, PNG, or JPG document")
+    if file.content_type and file.content_type.lower() not in supported_types[extension]:
+        raise HTTPException(status_code=415, detail="The uploaded file type does not match its extension")
+    content = file.file.read(settings.document_max_size_bytes + 1)
+    if len(content) > settings.document_max_size_bytes:
+        raise HTTPException(status_code=413, detail="Document exceeds the configured upload size limit")
+    stored_name = f"{uuid4().hex}{extension}"
+    storage_dir = Path(settings.document_storage_dir).resolve()
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    stored_path = storage_dir / stored_name
+    with stored_path.open("xb") as stored_file:
+        stored_file.write(content)
+    document = Document(employee_id=employee.id, file_name=original_name, file_url=stored_name)
+    db.add(document)
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        stored_path.unlink(missing_ok=True)
+        raise
+    db.refresh(document)
+    return document_out(document)
+
+
+@app.get("/documents/{document_id}/download", tags=["Documents"])
+def download_document(document_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if user.role == Role.EMPLOYEE and document.employee.user_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only access your own documents")
+    stored_name = Path(document.file_url).name
+    stored_path = Path(settings.document_storage_dir).resolve() / stored_name
+    if not stored_path.is_file():
+        raise HTTPException(status_code=404, detail="Document file is unavailable")
+    return FileResponse(stored_path, media_type="application/octet-stream", filename=document.file_name)
+
+
+@app.get("/performance", response_model=list[PerformanceOut], tags=["Performance"])
+def list_performance(employee_id: int | None = None, user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    query = select(Performance).join(Employee)
+    if user.role == Role.EMPLOYEE:
+        query = query.where(Employee.user_id == user.id)
+    elif employee_id is not None:
+        query = query.where(Performance.employee_id == employee_id)
+    return [performance_out(row) for row in db.scalars(query.order_by(Performance.created_at.desc())).all()]
+
+
+@app.post("/performance", response_model=PerformanceOut, status_code=201, tags=["Performance"])
+def create_performance_review(payload: PerformanceCreate, user: User = Depends(require_roles(Role.HR, Role.ADMIN)),
+                              db: Session = Depends(get_db)):
+    if db.get(Employee, payload.employee_id) is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    row = Performance(**payload.model_dump())
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return performance_out(row)
+
+
+@app.get("/reports/analytics", tags=["Reports"])
+def advanced_analytics(start_date: date | None = None, end_date: date | None = None,
+                       department: str | None = Query(default=None, max_length=120),
+                       user: User = Depends(require_roles(Role.HR, Role.ADMIN)), db: Session = Depends(get_db)):
+    start = start_date or date.today().replace(day=1)
+    end = end_date or date.today()
+    if end < start or (end - start).days > 3660:
+        raise HTTPException(status_code=422, detail="Report range must be valid and no longer than ten years")
+    attendance_query = select(
+        Attendance.date, Attendance.status, Attendance.is_late, func.count(Attendance.id),
+    ).join(Employee).where(Attendance.date >= start, Attendance.date <= end)
+    leave_query = select(Leave.start_date, Leave.status).join(Employee).where(
+        Leave.start_date <= end, Leave.end_date >= start,
+    )
+    performance_query = select(Employee.department, func.avg(Performance.rating), func.count(Performance.id)).join(
+        Employee, Performance.employee_id == Employee.id,
+    ).where(func.date(Performance.created_at) >= start.isoformat(),
+            func.date(Performance.created_at) <= end.isoformat())
+    employee_query = select(Employee.department, func.count(Employee.id))
+    if department:
+        attendance_query = attendance_query.where(func.lower(Employee.department) == department.lower())
+        leave_query = leave_query.where(func.lower(Employee.department) == department.lower())
+        performance_query = performance_query.where(func.lower(Employee.department) == department.lower())
+        employee_query = employee_query.where(func.lower(Employee.department) == department.lower())
+    attendance_rows = db.execute(attendance_query.group_by(Attendance.date, Attendance.status, Attendance.is_late)
+                                 .order_by(Attendance.date)).all()
+    attendance_counts: dict[tuple[date, AttendanceStatus], int] = {}
+    for day, row_status, is_late, count in attendance_rows:
+        state = AttendanceStatus.LATE if is_late else row_status
+        key = (day, state)
+        attendance_counts[key] = attendance_counts.get(key, 0) + count
+    leave_counts: dict[tuple[str, LeaveStatus], int] = {}
+    for leave_start, leave_status in db.execute(leave_query.order_by(Leave.start_date)).all():
+        key = (leave_start.strftime("%Y-%m"), leave_status)
+        leave_counts[key] = leave_counts.get(key, 0) + 1
+    performance_rows = db.execute(performance_query.group_by(Employee.department)
+                                  .order_by(Employee.department)).all()
+    department_rows = db.execute(employee_query.group_by(Employee.department)
+                                 .order_by(Employee.department)).all()
+    return {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "department": department,
+        "attendance_trends": [
+            {"date": day.isoformat(), "status": state.value, "count": count}
+            for (day, state), count in sorted(attendance_counts.items(), key=lambda item: (item[0][0], item[0][1].value))
+        ],
+        "leave_trends": [
+            {"month": month, "status": state.value, "count": count}
+            for (month, state), count in sorted(leave_counts.items(), key=lambda item: (item[0][0], item[0][1].value))
+        ],
+        "performance_by_department": [
+            {"department": dept, "average_rating": round(float(avg_rating or 0), 2), "reviews": count}
+            for dept, avg_rating, count in performance_rows
+        ],
+        "employees_by_department": [
+            {"department": dept, "employees": count} for dept, count in department_rows
+        ],
+    }
 
 
 @app.get("/leave-policies", response_model=list[LeavePolicyOut], tags=["Leaves"])
@@ -614,12 +985,22 @@ def read_notification(notification_id: int, user: User = Depends(get_current_use
 def dashboard(user: User = Depends(require_roles(Role.HR, Role.ADMIN)), db: Session = Depends(get_db)):
     today = date.today()
     month = today.strftime("%Y-%m")
+    attendance_breakdown = {}
+    for state in AttendanceStatus:
+        state_filter = Attendance.status == state
+        if state == AttendanceStatus.LATE:
+            state_filter = (Attendance.status == state) | Attendance.is_late.is_(True)
+        elif state == AttendanceStatus.PRESENT:
+            state_filter = (Attendance.status == state) & Attendance.is_late.is_(False)
+        attendance_breakdown[state.value] = db.scalar(select(func.count(Attendance.id)).where(
+            Attendance.date == today, state_filter,
+        )) or 0
     return {
         "total_employees": db.scalar(select(func.count(Employee.id)).where(Employee.status == EmployeeStatus.ACTIVE)) or 0,
         "present_today": db.scalar(select(func.count(Attendance.id)).where(Attendance.date == today, Attendance.status == AttendanceStatus.PRESENT)) or 0,
         "pending_leaves": db.scalar(select(func.count(Leave.id)).where(Leave.status == LeaveStatus.PENDING)) or 0,
         "payroll_this_month": db.scalar(select(func.coalesce(func.sum(Payroll.net_salary), 0)).where(Payroll.month == month)) or 0,
-        "attendance_breakdown": {state.value: db.scalar(select(func.count(Attendance.id)).where(Attendance.date == today, Attendance.status == state)) or 0 for state in AttendanceStatus},
+        "attendance_breakdown": attendance_breakdown,
         "leave_breakdown": {state.value: db.scalar(select(func.count(Leave.id)).where(Leave.status == state)) or 0 for state in LeaveStatus},
     }
 

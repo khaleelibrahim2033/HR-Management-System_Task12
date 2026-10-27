@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 from typing import Literal
 
@@ -86,6 +86,7 @@ class EmployeeOut(ORMModel):
     status: EmployeeStatus
     username: str = ""
     email: EmailStr = ""
+    role: Role = Role.EMPLOYEE
 
 
 class AttendanceMark(BaseModel):
@@ -104,6 +105,8 @@ class AttendanceOut(ORMModel):
     date: date
     status: AttendanceStatus
     is_late: bool = False
+    is_early: bool = False
+    is_early_out: bool = False
     working_hours: float = 0
     employee_name: str = ""
 
@@ -193,4 +196,65 @@ class NotificationOut(ORMModel):
     title: str
     message: str
     is_read: bool
+    created_at: datetime
+
+
+class ShiftCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    start_time: time
+    end_time: time
+
+    @model_validator(mode="after")
+    def different_shift_times(self):
+        if self.start_time == self.end_time:
+            raise ValueError("start_time and end_time must differ")
+        return self
+
+
+class ShiftOut(ORMModel):
+    id: int
+    name: str
+    start_time: time
+    end_time: time
+
+
+class EmployeeShiftAssign(BaseModel):
+    employee_id: int
+    shift_id: int
+
+
+class EmployeeShiftOut(BaseModel):
+    id: int
+    employee_id: int
+    employee_name: str
+    department: str
+    shift_id: int
+    shift_name: str
+    start_time: time
+    end_time: time
+
+
+class DocumentOut(ORMModel):
+    id: int
+    employee_id: int
+    employee_name: str
+    file_name: str
+    file_url: str
+    uploaded_at: datetime
+
+
+class PerformanceCreate(BaseModel):
+    employee_id: int
+    review_period: str = Field(min_length=1, max_length=80)
+    rating: float = Field(ge=1, le=5)
+    feedback: str = Field(min_length=1, max_length=5000)
+
+
+class PerformanceOut(ORMModel):
+    id: int
+    employee_id: int
+    employee_name: str
+    review_period: str
+    rating: float
+    feedback: str
     created_at: datetime

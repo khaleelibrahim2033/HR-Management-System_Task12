@@ -1,6 +1,6 @@
 # WorkSphere HRMS
 
-WorkSphere is a full-stack HR management system built with FastAPI, SQLAlchemy, SQLite, and React. Phase 2 adds server-enforced role-based authorization, employee self-service, leave policies and balances, late/absent attendance handling, expanded payroll breakdowns, and administrator user management.
+WorkSphere is a full-stack HR management system built with FastAPI, SQLAlchemy, SQLite, and React. It includes role-based authorization, employee self-service, leave policies and balances, payroll, shift and attendance automation, a team leave calendar, protected employee documents, performance reviews, analytics, and employee search filters.
 
 ## Requirements
 
@@ -30,6 +30,17 @@ The optional `BOOTSTRAP_ADMIN_*` settings create one administrator if no admin a
 JWT role claims are checked against the current active database account on each authenticated request; role changes and deactivation invalidate previously issued tokens. HR/Admin can manage employee records, review leave, view attendance, and generate payroll. Employees only receive their own profile, attendance, leave, and payroll data. Administrator analytics and user-role management are admin-only.
 
 Leave policies are initialized with 10 sick, 10 casual, and 15 paid days for a new database. Approved requests deduct calendar days from the employee balance; pending requests reserve available capacity. Attendance check-ins after `ATTENDANCE_LATE_AFTER` (09:00 by default) in server-local time are marked late. Missing attendance is automatically recorded for the previous working day when attendance history is requested, except when an approved leave covers that date. Existing databases are upgraded in place for the added user, attendance, and payroll fields.
+
+## Phase 3 features
+
+- Morning, Evening, and Night shifts are created by default. HR/Admin can define additional shifts and assign one current shift per employee. Early/late check-ins and early check-outs are flagged against shift hours; late arrivals notify the employee and HR/Admin. Missing records for the previous working day are marked absent after the assigned shift ends when attendance history is requested.
+- The leave calendar displays pending and approved team leave for a selected date range and department. Employee leave requests cannot overlap another active request for the same employee.
+- Documents accept PDF, DOC/DOCX, PNG, and JPG/JPEG files up to `DOCUMENT_MAX_SIZE_BYTES` (10 MiB by default). Files are stored outside the public web root in `DOCUMENT_STORAGE_DIR` (defaults to `backend/uploads`) and are only served through authenticated, ownership-checked download routes. HR/Admin can manage documents across employees; employees can access only their own.
+- HR/Admin can add 1–5 performance reviews; employees can view their own review history.
+- `/reports/analytics` provides attendance, leave, department headcount, and performance summaries with date and department filters. Employee directory filters include name/email/title/department search, role, status, today's attendance, and minimum performance rating.
+- Notifications are refreshed by the web app every 30 seconds while signed in. Late check-ins, leave decisions, and payroll generation create notifications.
+
+Set `DOCUMENT_STORAGE_DIR` to a private persistent directory and tune `DOCUMENT_MAX_SIZE_BYTES` for deployment. Keep that storage outside any static-file server and back it up using the same controls as other HR records.
 
 ## Start the web app
 
